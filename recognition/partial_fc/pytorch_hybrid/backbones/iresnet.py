@@ -1,9 +1,8 @@
 import torch
 from torch import nn
 from torchvision.models.utils import load_state_dict_from_url
-from ibug.roi_tanh_warping import (roi_tanh_polar_warp,
-                                   roi_tanh_polar_to_roi_tanh,
-                                   roi_tanh_to_roi_tanh_polar)
+from ibug.roi_tanh_warping import roi_tanh_polar_warp
+
 __all__ = ['iresnet34', 'iresnet50', 'iresnet100']
 
 model_urls = {
@@ -11,7 +10,6 @@ model_urls = {
     'iresnet50': 'https://sota.nizhib.ai/insightface/iresnet50-7f187506.pth',
     'iresnet100': 'https://sota.nizhib.ai/insightface/iresnet100-73e07ba7.pth'
 }
-
 
 def get_rois(x):
     b, _, h, w = x.size()
@@ -21,62 +19,15 @@ def get_rois(x):
     return rois
 
 
-def conv3x3(in_planes, out_planes, stride=1, groups=1, dilation=1,
-            mix_padding=False, padding_modes=['replicate', 'circular']):
+def conv3x3(in_planes, out_planes, stride=1, groups=1, dilation=1):
     """3x3 convolution with padding"""
-    # return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
-    #                  padding=dilation, groups=groups, bias=False, dilation=dilation)
-
-    if not mix_padding:
-        return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
-                         padding=dilation, groups=groups, bias=False, dilation=dilation)
-
-    else:
-        return nn.Sequential(
-            MixPad2d([dilation, dilation], padding_modes),
-            nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
-                      padding=0, bias=False, groups=groups, dilation=dilation)
-        )
+    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
+                     padding=dilation, groups=groups, bias=False, dilation=dilation)
 
 
-def conv1x1(in_planes, out_planes, stride=1, groups=1):
+def conv1x1(in_planes, out_planes, stride=1):
     """1x1 convolution"""
-    return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride,
-                     bias=False, groups=groups)
-
-
-class MixPad2d(nn.Module):
-    """Mixed padding modes for H and W dimensions
-
-    Args:
-        padding (tuple): the size of the padding for x and y, ie (pad_x, pad_y)
-        modes (tuple): the padding modes for x and y, the values of each can be
-            ``'constant'``, ``'reflect'``, ``'replicate'`` or ``'circular'``.
-            Default: ``['replicate', 'circular']``
-
-    """
-    __constants__ = ['modes', 'padding']
-
-    def __init__(self, padding=[1, 1], modes=['replicate', 'circular']):
-        super(MixPad2d, self).__init__()
-        assert len(padding) == 2
-        self.padding = padding  # x, y
-        self.modes = modes
-
-    def forward(self, x):
-        #  (left, right, top, down) is used in nn.functional.pad
-        # pad height (y axis)
-        x = nn.functional.pad(
-            x, (0, 0,  self.padding[1], self.padding[1]), self.modes[1])
-        # pad width (x axis)
-        x = nn.functional.pad(
-            x, (self.padding[0], self.padding[0], 0, 0), self.modes[0])
-        return x
-
-    def extra_repr(self):
-        repr_ = """Mixed Padding: \t x axis: mode: {}, padding: {},\n\t y axis mode: {}, padding: {}""".format(
-            self.modes[0], self.padding[0], self.modes[1], self.padding[1])
-        return repr_
+    return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
 
 
 class IBasicBlock(nn.Module):
@@ -86,24 +37,16 @@ class IBasicBlock(nn.Module):
                  base_width=64, dilation=1):
         super(IBasicBlock, self).__init__()
         if groups != 1 or base_width != 64:
-            raise ValueError(
-                'BasicBlock only supports groups=1 and base_width=64')
+            raise ValueError('BasicBlock only supports groups=1 and base_width=64')
         if dilation > 1:
-            raise NotImplementedError(
-                "Dilation > 1 not supported in BasicBlock")
+            raise NotImplementedError("Dilation > 1 not supported in BasicBlock")
         # Both self.conv1 and self.downsample layers downsample the input when stride != 1
         self.bn1 = nn.BatchNorm2d(inplanes, eps=1e-05, )
-        self.conv1 = conv3x3(inplanes, planes, groups=2)
-        self.bn2_t = nn.BatchNorm2d(planes//2, eps=1e-05, )
-        self.bn2_c = nn.BatchNorm2d(planes//2, eps=1e-05, )
-        self.prelu_t = nn.PReLU(planes//2)
-        self.prelu_c = nn.PReLU(planes//2)
-
-        self.conv2_t = conv3x3(planes//2, planes//2, stride, mix_padding=True)
-        self.conv2_c = conv3x3(planes//2, planes//2, stride, mix_padding=False)
-
-        self.bn3_t = nn.BatchNorm2d(planes//2, eps=1e-05, )
-        self.bn3_c = nn.BatchNorm2d(planes//2, eps=1e-05, )
+        self.conv1 = conv3x3(inplanes, planes)
+        self.bn2 = nn.BatchNorm2d(planes, eps=1e-05, )
+        self.prelu = nn.PReLU(planes)
+        self.conv2 = conv3x3(planes, planes, stride)
+        self.bn3 = nn.BatchNorm2d(planes, eps=1e-05, )
         self.downsample = downsample
         self.stride = stride
 
@@ -112,30 +55,11 @@ class IBasicBlock(nn.Module):
 
         out = self.bn1(x)
         out = self.conv1(out)
-        out_t, out_c = torch.chunk(out, 2, dim=1)
+        out = self.bn2(out)
+        out = self.prelu(out)
+        out = self.conv2(out)
+        out = self.bn3(out)
 
-        # warping to tanh-cartesian
-        _, _, h, w = out_c.size()
-        rois = get_rois(out_c)
-        out_c = roi_tanh_polar_to_roi_tanh(out_c, rois, (h, w),
-                                           keep_aspect_ratio=True)
-
-        out_t = self.bn2_t(out_t)
-        out_t = self.prelu_t(out_t)
-
-        out_c = self.bn2_c(out_c)
-        out_c = self.prelu_c(out_c)
-
-        out_t = self.conv2_t(out_t)
-        out_t = self.bn3_t(out_t)
-
-        out_c = self.conv2_c(out_c)
-        out_c = self.bn3_c(out_c)
-        _, _, h, w = out_c.size()
-        rois = get_rois(out_c)
-        out_c = roi_tanh_to_roi_tanh_polar(out_c, rois, (h, w),
-                                           keep_aspect_ratio=True)
-        out = torch.cat((out_t, out_c), dim=1)
         if self.downsample is not None:
             identity = self.downsample(x)
 
@@ -162,7 +86,8 @@ class IResNet(nn.Module):
                              "or a 3-element tuple, got {}".format(replace_stride_with_dilation))
         self.groups = groups
         self.base_width = width_per_group
-        self.conv1 = conv3x3(3, self.inplanes, stride=1, dilation=1, mix_padding=True)
+        self.conv1 = nn.Conv2d(3, self.inplanes, kernel_size=3, stride=1, padding=1,
+                               bias=False)
         self.bn1 = nn.BatchNorm2d(self.inplanes, eps=1e-05)
         self.prelu = nn.PReLU(self.inplanes)
         self.layer1 = self._make_layer(block, 64, layers[0], stride=2)
@@ -176,14 +101,12 @@ class IResNet(nn.Module):
 
         self.bn2 = nn.BatchNorm2d(512 * block.expansion, eps=1e-05, )
         self.dropout = nn.Dropout(p=0.4, inplace=True)
-        self.fc = nn.Linear(512 * block.expansion *
-                            self.fc_scale, num_features)
+        self.fc = nn.Linear(512 * block.expansion * self.fc_scale, num_features)
         self.features = nn.BatchNorm1d(num_features, eps=1e-05, )
 
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(
-                    m.weight, mode='fan_out', nonlinearity='relu')
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
             elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
@@ -216,11 +139,9 @@ class IResNet(nn.Module):
         return nn.Sequential(*layers)
 
     def forward(self, x):
-        _, _, h, w = x.size()
+        h, w = x.shape[-2:]
         rois = get_rois(x)
-        with torch.no_grad():
-            x = roi_tanh_polar_warp(x, rois, (h, w), keep_aspect_ratio=True)
-
+        x = roi_tanh_polar_warp(x, rois, (h,w), keep_aspect_ratio=True).clip(-1, 1)
         x = self.conv1(x)
         x = self.bn1(x)
         x = self.prelu(x)

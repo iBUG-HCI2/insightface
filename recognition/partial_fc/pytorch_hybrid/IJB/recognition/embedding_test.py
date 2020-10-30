@@ -9,7 +9,12 @@ import sklearn
 from sklearn import preprocessing
 import torch 
 from torchvision import transforms
-sys.path.append('/root/xy/work_dir/xyface/')
+import os
+import os.path as osp
+work_dir = osp.abspath(__file__)
+work_dir = osp.abspath(osp.join(work_dir, '..', '..', '..'))
+print(work_dir)
+sys.path.append(work_dir)
 from  backbones import iresnet50,iresnet100
 from torch.nn.parallel import DistributedDataParallel
 
@@ -21,7 +26,8 @@ class Embedding:
         image_size = (112, 112)
         self.image_size = image_size
         weight = torch.load(prefix)
-        resnet = iresnet50().cuda()
+        # resnet = iresnet50().cuda()
+        resnet = iresnet100().cuda()
         resnet.load_state_dict(weight)
         model = torch.nn.DataParallel(resnet)
         self.model = model
